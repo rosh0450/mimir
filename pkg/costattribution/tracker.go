@@ -13,8 +13,9 @@ import (
 )
 
 type Observation struct {
-	lvalues    []string
-	lastUpdate *atomic.Int64
+	lvalues          []string
+	lastUpdate       *atomic.Int64
+	activeserieCount *atomic.Int64
 }
 
 const (
@@ -126,23 +127,23 @@ func (t *Tracker) IncrementActiveSeries(lbs labels.Labels, now time.Time) {
 	if t == nil {
 		return
 	}
-	vals := t.getKeyValues(lbs, now.Unix())
-	t.activeSeriesPerUserAttribution.WithLabelValues(vals...).Inc()
+	_ = t.getKeyValues(lbs, now.Unix(), 1)
+	// t.activeSeriesPerUserAttribution.WithLabelValues(vals...).Inc()
 }
 
 func (t *Tracker) DecrementActiveSeries(lbs labels.Labels, now time.Time) {
 	if t == nil {
 		return
 	}
-	vals := t.getKeyValues(lbs, now.Unix())
-	t.activeSeriesPerUserAttribution.WithLabelValues(vals...).Dec()
+	_ = t.getKeyValues(lbs, now.Unix(), -1)
+	// t.activeSeriesPerUserAttribution.WithLabelValues(vals...).Dec()
 }
 
 func (t *Tracker) IncrementDiscardedSamples(lbs labels.Labels, value float64, reason string, now time.Time) {
 	if t == nil {
 		return
 	}
-	vals := t.getKeyValues(lbs, now.Unix())
+	vals := t.getKeyValues(lbs, now.Unix(), 0)
 	if t.isOverflow {
 		vals = append(vals, overflowValue)
 	} else {
@@ -155,7 +156,7 @@ func (t *Tracker) IncrementReceivedSamples(lbs labels.Labels, value float64, now
 	if t == nil {
 		return
 	}
-	vals := t.getKeyValues(lbs, now.Unix())
+	vals := t.getKeyValues(lbs, now.Unix(), 0)
 	t.receivedSamplesAttribution.WithLabelValues(vals...).Add(value)
 }
 
@@ -163,6 +164,12 @@ func (t *Tracker) Collect(out chan<- prometheus.Metric) {
 	if t == nil {
 		return
 	}
+	for _, ob := range t.observed {
+		if ob != nil {
+			t.activeSeriesPerUserAttribution.WithLabelValues(ob.lvalues...).Set(float64(ob.activeserieCount.Load()))
+		}
+	}
+
 	t.activeSeriesPerUserAttribution.Collect(out)
 	t.receivedSamplesAttribution.Collect(out)
 	t.discardedSampleAttribution.Collect(out)
@@ -176,7 +183,7 @@ func (t *Tracker) Describe(chan<- *prometheus.Desc) {
 	}
 }
 
-func (t *Tracker) getKeyValues(lbls labels.Labels, ts int64) []string {
+func (t *Tracker) getKeyValues(lbls labels.Labels, ts int64, activeSerieIncrease int64) []string {
 	if t == nil {
 		return nil
 	}
@@ -191,7 +198,7 @@ func (t *Tracker) getKeyValues(lbls labels.Labels, ts int64) []string {
 	var stream uint64
 	stream, _ = lbls.HashForLabels(t.hashBuffer, t.caLabels...)
 
-	if t.overflow(stream, values, ts) {
+	if t.overflow(stream, values, ts, activeSerieIncrease) {
 		// Omit last label.
 		for i := range values[:len(values)-1] {
 			values[i] = overflowValue
@@ -200,7 +207,7 @@ func (t *Tracker) getKeyValues(lbls labels.Labels, ts int64) []string {
 	return values
 }
 
-func (t *Tracker) overflow(stream uint64, values []string, ts int64) bool {
+func (t *Tracker) overflow(stream uint64, values []string, ts int64, activeSerieIncrease int64) bool {
 	if t == nil {
 		return false
 	}
@@ -208,10 +215,14 @@ func (t *Tracker) overflow(stream uint64, values []string, ts int64) bool {
 	// we store up to 2 * maxCardinality observations, if we have seen the stream before, we update the last update time
 	if o, known := t.observed[stream]; known && o.lastUpdate != nil && o.lastUpdate.Load() < ts {
 		o.lastUpdate.Store(ts)
+		if activeSerieIncrease != 0 {
+			o.activeserieCount.Add(activeSerieIncrease)
+		}
 	} else if len(t.observed) < t.maxCardinality*2 {
 		t.observed[stream] = &Observation{
-			lvalues:    values,
-			lastUpdate: atomic.NewInt64(ts),
+			lvalues:          values,
+			lastUpdate:       atomic.NewInt64(ts),
+			activeserieCount: atomic.NewInt64(activeSerieIncrease),
 		}
 	}
 
